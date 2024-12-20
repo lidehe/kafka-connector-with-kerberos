@@ -1,0 +1,177 @@
+========================= 编译 =========================
+# 编译时报错：
+# https://repo.maven.apache.org/maven2/org/codehaus/groovy/modules/http-builder/http-builder/0.7.2/http-builder-0.7.2.pom
+
+
+# 分析原因：
+# com.jfrog.bintray的1.7版本依赖http-builder-0.7.2
+# 但是http-builder-0.7.2的开发人员没有把这个0.7.2推送到maven中央仓库
+# https://github.com/jgritman/httpbuilder/issues/35
+
+
+# 解决方法：
+# 总体思路是把http-builder-0.7.2安装到本地maven
+
+# 1.下载源码
+https://github.com/jgritman/httpbuilder/tree/http-builder-0.7.2
+
+# 2.编译，一定要跳过测试和doc生成，否则很慢且报错doc相关
+mvn clean package -DskipTests -Dmaven.javadoc.skip=true
+
+# 3.安装http-builder-0.7.2到本地仓库
+mvn install:install-file -DgroupId=org.codehaus.groovy.modules.http-builder -DartifactId=http-builder  -Dversion=0.7.2 -Dpackaging=jar -Dfile=/Users/ldh/Downloads/httpbuilder-http-builder-0.7.2/target/http-builder-0.7.2.jar
+
+# 4.设置gradle使用本地Maven仓库
+# 在build.gradle里最前面添加如下内容
+buildscript {
+    repositories {
+        maven { url "file://Users/ldh/devtools/maven-3.8.3/repository" }
+    }
+    dependencies {
+        classpath ("org.codehaus.groovy.modules.http-builder:http-builder:0.7.2")
+    }
+}
+
+
+# 5.补充，为了把依赖打进去，要添加如下
+plugins {
+	...
+	id 'com.github.johnrengelman.shadow' version '1.2.4'
+}
+
+shadowJar {
+    baseName='kafka-connect-mqtt'  // jar 文件的基本名字
+    version='1.0.0'  // jar 文件的版本号
+
+}
+
+# 另外，打包命令也变成了
+./gradlew shadowJar
+
+
+
+
+========================= 部署 =========================
+对接开启kerberos的kafka集群特别要注意sasl.jaas.config和producer.sasl.jaas.config两个参数，一定不要配置成jaas.conf文件的位置
+
+0.部署Kafka Connect for MQTT
+根据编译的文档，编译出带有全部依赖的jar
+把jar放到容器里/usr/lib/transwarp/plugins目录里，步骤1里配置的plugin.path指定的位置
+
+
+1.配置并启动kafka-connector
+进入kafka容器（注意，不在容器里操作也可以，参考本文末尾）
+cd /usr/lib/kafka
+vi config/connect-distributed.properties
+修改如下内容:
+
+bootstrap.servers=linux-131-111:9092,linux-131-112:9092,linux-131-113:9092
+group.id=connect-cluster
+key.converter=org.apache.kafka.connect.json.JsonConverter
+value.converter=org.apache.kafka.connect.json.JsonConverter
+key.converter.schemas.enable=true
+value.converter.schemas.enable=true
+offset.storage.topic=connect-offsets
+offset.storage.replication.factor=1
+config.storage.topic=connect-configs
+config.storage.replication.factor=1
+status.storage.topic=connect-status
+status.storage.replication.factor=1
+offset.flush.interval.ms=10000
+rest.host.name=linux-131-111
+rest.port=8083
+plugin.path=/usr/lib/transwarp/plugins
+# 如果集群开了kerberos安全，需要加上如下参数
+security.protocol=SASL_PLAINTEXT
+sasl.mechanism=GSSAPI
+sasl.kerberos.service.name=kafka
+sasl.jaas.config=com.sun.security.auth.module.Krb5LoginModule required refreshKrb5Config=true useKeyTab=true storeKey=true useTicketCache=false keyTab="/etc/eventstore1/conf/kafka.keytab" principal="kafka/linux-131-111@TDH";
+producer.sasl.kerberos.service.name=kafka
+producer.security.protocol=SASL_PLAINTEXT
+producer.sasl.mechanism=GSSAPI
+producer.sasl.jaas.config=com.sun.security.auth.module.Krb5LoginModule required useKeyTab=true storeKey=true keyTab="/etc/eventstore1/conf/kafka.keytab" principal="kafka/linux-131-111@TDH";
+
+
+启动connector
+bin/connect-distributed.sh config/connect-distributed.properties
+
+
+
+
+
+
+
+
+2.配置并提交source-connector
+这里一定要注意value.converter要跟源头数据一致！本案例中，value取的是mqtt的payload，这个是字节码，所以要用org.apache.kafka.connect.converters.ByteArrayConverter
+vi mqtt-source.json
+{
+  "name": "new_mqtt-source-connector",
+  "config": {
+    "connector.class": "com.evokly.kafka.connect.mqtt.MqttSourceConnector",
+    "tasks.max": "1",
+    "mqtt.server_uris": "tcp://175.6.40.67:8458",
+    "mqtt.topic": "hzinfo_v4_yc/18573151549",
+    "kafka.topic": "mq_message",
+    "mqtt.qos": "1",
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.converters.ByteArrayConverter",
+    "mqtt.user": "18573151549",
+    "mqtt.password": "1qaz2WSX!"
+  }
+}
+
+执行source
+curl -X POST -H "Content-Type: application/json" --data @mqtt-source.json http://tw-node1:8083/connectors
+
+
+
+
+3.查询connector 
+curl -i -X GET http://tw-node1:8083/connectors/
+
+
+4.删除connector 
+curl -i -X DELETE http://tw-node1:8083/connectors/new_mqtt-source-connector
+
+
+
+
+5.其他api
+由于 Kafka Connect 的目的是作为一个服务运行，提供了一个用于管理 Connector 的 REST API。默认情况下，此服务的端口是8083。以下是当前支持的终端入口：
+GET /Connectors：返回活跃的 Connector 列表
+POST /Connectors：创建一个新的 Connector；请求的主体是一个包含字符串name字段和对象 config 字段（Connector 的配置参数）的 JSON 对象。
+GET /Connectors/{name}：获取指定 Connector 的信息
+GET /Connectors/{name}/config：获取指定 Connector 的配置参数
+PUT /Connectors/{name}/config：更新指定 Connector 的配置参数
+GET /Connectors/{name}/status：获取 Connector 的当前状态，包括它是否正在运行，失败，暂停等。
+GET /Connectors/{name}/tasks：获取当前正在运行的 Connector 的任务列表。
+GET /Connectors/{name}/tasks/{taskid}/status：获取任务的当前状态，包括是否是运行中的，失败的，暂停的等，
+PUT /Connectors/{name}/pause：暂停连接器和它的任务，停止消息处理，直到 Connector 恢复。
+PUT /Connectors/{name}/resume：恢复暂停的 Connector（如果 Connector 没有暂停，则什么都不做）
+POST /Connectors/{name}/restart：重启 Connector（Connector 已故障）
+POST /Connectors/{name}/tasks/{taskId}/restart：重启单个任务 (通常这个任务已失败)
+DELETE /Connectors/{name}：删除 Connector, 停止所有的任务并删除其配置
+Kafka Connector 还提供了获取有关 Connector plugins 信息的 REST API：
+GET /Connector-plugins：返回已在 Kafka Connect 集群安装的 Connector plugin 列表。请注意，API 仅验证处理请求的 worker 的 Connector。这以为着你可能看不不一致的结果，特别是在滚动升级的时候（添加新的 Connector jar）
+PUT /Connector-plugins/{Connector-type}/config/validate ：对提供的配置值进行验证，执行对每个配置验证，返回验证的建议值和错误信息
+
+
+
+
+6.debug连接器Kafka Connect for MQTT
+6.1.在kafka容器中 
+  export KAFKA_OPTS=-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005
+  bin/connect-distributed.sh config/connect-distributed.properties
+
+6.2.在idea中配置好remote debug参数
+  启动debug
+
+
+
+7.启动Kafka Connect的命令也可以不在容器里执行
+  1.仍然要把connector的jar放到容器里，可以固化到镜像里，省的每次重启都要重新上传
+  2.进入TDH-Client里kafka目录下
+  3.执行bin/connect-distributed.sh config/connect-distributed.properties
+    注意，config/connect-distributed.properties里的plugin.path要写connector的jar在容器里的路径
+
